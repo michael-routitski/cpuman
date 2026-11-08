@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This command requires root privileges. Please run with sudo."
+        exit 1
+    fi
+}
+
+cmd_install() {
+    require_root
+    echo "==> Updating package lists..."
+    apt-get update
+    echo "==> Installing lm-sensors and linux-cpupower..."
+    apt-get install -y lm-sensors linux-cpupower
+    echo "==> Running automated sensor detection..."
+    sensors-detect --auto
+    echo "==> Setup complete!"
+}
+
+cmd_monitor() {
+    if ! command -v sensors &>/dev/null; then
+        echo "lm-sensors not found. Please run 'sudo cpuman install' first."
+        exit 1
+    fi
+
+    if [[ ! -f /usr/local/bin/formattemp.sh ]]; then
+        echo "Helper script /usr/local/bin/formattemp.sh not found!"
+        exit 1
+    fi
+
+    # Hide cursor on start, show cursor and clear screen on exit
+    trap 'tput cnorm; clear; exit 0' INT TERM
+    tput civis
+    clear
+
+    while true; do
+        # Move cursor to top-left (home) position without clearing screen to eliminate flicker
+        tput cup 0 0
+        
+        echo "=== Active Dynamic CPU Monitor (Press Ctrl+C to exit) ==="
+        echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "---------------------------------------------------------"
+        
+        # Render formatted table output and clear to end of screen
+        /usr/local/bin/formattemp.sh
+        tput ed
+        
+        sleep 1
+    done
+}
+
+cmd_cap_speed() {
+    require_root
+    local target="$1"
+
+    if [[ -z "$target" ]]; then
+        echo "Usage: sudo cpuman cap-speed <N> (e.g., 2.5, 3.0, or 0 to uncap)"
+        exit 1
+    fi
+
+    # Uncap
+    if [[ "$target" == "0" || "$target" == "0.0" ]]; then
+        echo "==> Removing CPU frequency cap..."
+        
+        if [[ -f /sys/devices/system/cpu/intel_pstate/status ]]; then
+            echo active > /sys/devices/system/cpu/intel_pstate/status 2>/dev/null || true
+        fi
+        if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+            echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true
+        fi
+        if [[ -f /sys/devices/system/cpu/intel_pstate/max_perf_pct ]]; then
+            echo 100 > /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null || true
+        fi
+
+        cpupower frequency-set -g powersave &>/dev/null || cpupower frequency-set -g schedutil &>/dev/null || true
+
+        for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+            if [[ -f "$f" ]]; then
+                max_avail=$(cat "${f%scaling_max_freq}cpuinfo_max_freq" 2>/dev/null)
+                if [[ -n "$max_avail" ]]; then echo "$max_avail" > "$f" 2>/dev/null; fi
+            fi
+        done
+
+        echo "UNCAPPED" > /etc/cpuman_cap.conf
+        chmod 644 /etc/cpuman_cap.conf
+        if [[ -f /etc/systemd/system/cpuman-cap.service ]]; then
+            sed -i 's/ExecStart=.*/ExecStart=\/usr\/local\/bin\/cpuman cap-speed 0/' /etc/systemd/system/cpuman-cap.service
+            systemctl daemon-reload
+        fi
+
+        echo "==> Frequency cap removed."
+        return 0
+    fi
+
+    local max_hw_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null)
+    if [[ -z "$max_hw_freq" || "$max_hw_freq" -eq 0 ]]; then
+        max_hw_freq=4700000
+    fi
+
+    local target_khz=$(awk -v val="$target" 'BEGIN { printf "%.0f", val * 1000000 }')
+    local pct=$(awk -v t="$target_khz" -v m="$max_hw_freq" 'BEGIN {
+        p = int((t / m) * 100);
+        if (p > 100) p = 100;
+        if (p < 20) p = 20;
+        print p;
+    }')
+
+    # 1. HARD DISABLE TURBO BOOST
+    if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+        echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true
+    fi
+
+    # 2. Switch to active driver mode
+    if [[ -f /sys/devices/system/cpu/intel_pstate/status ]]; then
+        echo active > /sys/devices/system/cpu/intel_pstate/status 2>/dev/null || true
+    fi
+
+    # 3. Apply percentage cap
+    if [[ -f /sys/devices/system/cpu/intel_pstate/max_perf_pct ]]; then
+        echo "$pct" > /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null || true
+    fi
+
+    # 4. Enforce sysfs frequency limit
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+        if [[ -f "$f" ]]; then
+            echo "$target_khz" > "$f" 2>/dev/null || true
+        fi
+    done
+
+    # 5. Ensure powersave governor is active
+    cpupower frequency-set -g powersave &>/dev/null || true
+
+    # 6. Save config state
+    echo "${target} GHz" > /etc/cpuman_cap.conf
+    chmod 644 /etc/cpuman_cap.conf
+
+    # 7. Update systemd service
+    if [[ -f /etc/systemd/system/cpuman-cap.service ]]; then
+        sed -i "s|ExecStart=.*|ExecStart=/usr/local/bin/cpuman cap-speed ${target}|" /etc/systemd/system/cpuman-cap.service
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+cmd_status() {
+    echo "=== CPU Hardware Management Status ==="
+    
+    if [[ -f /sys/devices/system/cpu/intel_pstate/status ]]; then
+        echo "Driver Mode: $(cat /sys/devices/system/cpu/intel_pstate/status)"
+    fi
+
+    if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+        no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo)
+        if [[ "$no_turbo" -eq 1 ]]; then
+            echo "Turbo Boost: DISABLED (Hard Cap Enforced)"
+        else
+            echo "Turbo Boost: ENABLED"
+        fi
+    fi
+
+    if [[ -f /sys/devices/system/cpu/intel_pstate/max_perf_pct ]]; then
+        echo "P-State Max Perf: $(cat /sys/devices/system/cpu/intel_pstate/max_perf_pct)%"
+    fi
+
+    echo "Active Governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo 'N/A')"
+    
+    max_limit=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null)
+    if [[ -n "$max_limit" ]]; then
+        ghz=$(awk -v val="$max_limit" 'BEGIN { printf "%.2f", val / 1000000 }')
+        echo "Current Scaling Max: ${ghz} GHz"
+    fi
+
+    if [[ -f /etc/cpuman_cap.conf ]]; then
+        echo "Configured Cap File: $(cat /etc/cpuman_cap.conf)"
+    fi
+
+    echo ""
+    /usr/local/bin/formattemp.sh
+}
+
+case "$1" in
+    install) cmd_install ;;
+    monitor) cmd_monitor ;;
+    cap-speed) cmd_cap_speed "$2" ;;
+    status) cmd_status ;;
+    *) echo "Usage: cpuman {install|monitor|cap-speed <N>|status}" ;;
+esac

@@ -29,4 +29,6 @@ for your package manager
 Once it's happy with the prerequisites and starts, drop it in `usr/local/bin` and run it. It will monitor in the bg.
 You can also configure it to start on boot. 
 
+**Note** The `formatter.sh` script needs to go to the same dir as `cpuman`
+
     
